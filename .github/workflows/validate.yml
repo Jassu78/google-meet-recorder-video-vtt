@@ -1,0 +1,33 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required extension files
+        run: |
+          for f in manifest.json background.js content.js offscreen.html offscreen.js popup.html popup.js; do
+            test -f "$f" || { echo "Missing $f"; exit 1; }
+          done
+
+      - name: Validate manifest.json
+        run: python3 -m json.tool manifest.json > /dev/null
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax-check JavaScript
+        run: |
+          node --check background.js
+          node --check content.js
+          node --check offscreen.js
+          node --check popup.js

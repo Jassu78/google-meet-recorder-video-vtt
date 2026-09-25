@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Google Meet Recorder (Video + .vtt)</title>
+  <meta name="description" content="Chrome extension that records Google Meet as .webm video and exports Meet captions as .vtt — locally." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,500;0,9..40,650;0,9..40,700;1,9..40,500&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg0: #0f1419;
+      --bg1: #171d25;
+      --text: #e8eaed;
+      --muted: #9aa0a6;
+      --blue: #8ab4f8;
+      --green: #81c995;
+      --red: #f28b82;
+      --yellow: #fdd663;
+      --line: rgba(255, 255, 255, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "DM Sans", system-ui, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(90% 60% at 50% -10%, rgba(66, 133, 244, 0.22), transparent 55%),
+        radial-gradient(50% 40% at 100% 100%, rgba(52, 168, 83, 0.12), transparent 50%),
+        var(--bg0);
+      line-height: 1.55;
+    }
+
+    .wrap {
+      width: min(720px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 56px 0 72px;
+      text-align: center;
+    }
+
+    .eyebrow {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--blue);
+      margin-bottom: 14px;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(1.7rem, 4vw, 2.35rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1.2;
+    }
+
+    h1 code {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.72em;
+      font-weight: 500;
+      color: var(--yellow);
+    }
+
+    .tagline {
+      margin: 0 auto 28px;
+      max-width: 34em;
+      color: var(--muted);
+      font-size: 1.05rem;
+    }
+
+    .pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      margin-bottom: 28px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 650;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .pill.blue { color: var(--blue); border-color: rgba(138, 180, 248, 0.35); }
+    .pill.green { color: var(--green); border-color: rgba(129, 201, 149, 0.35); }
+    .pill.red { color: var(--red); border-color: rgba(242, 139, 130, 0.35); }
+    .pill.yellow { color: var(--yellow); border-color: rgba(253, 214, 99, 0.35); }
+
+    .cta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: center;
+      margin-bottom: 36px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px 18px;
+      border-radius: 10px;
+      font-weight: 650;
+      font-size: 14px;
+      text-decoration: none;
+      transition: transform 0.15s ease, background 0.15s ease;
+    }
+
+    .btn:hover { transform: translateY(-1px); }
+
+    .btn-primary {
+      background: var(--blue);
+      color: #0b1a33;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--line);
+    }
+
+    .panel {
+      text-align: left;
+      background: var(--bg1);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 22px 22px 8px;
+      margin-bottom: 20px;
+    }
+
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    .panel p, .panel li {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .panel ol, .panel ul {
+      margin: 0 0 16px;
+      padding-left: 1.2em;
+    }
+
+    .panel li { margin-bottom: 6px; }
+
+    .note {
+      border-left: 3px solid var(--blue);
+      padding: 10px 12px;
+      margin: 0 0 16px;
+      background: rgba(138, 180, 248, 0.08);
+      border-radius: 0 10px 10px 0;
+      color: var(--text);
+      font-size: 0.92rem;
+    }
+
+    .note.warn {
+      border-left-color: var(--yellow);
+      background: rgba(253, 214, 99, 0.08);
+    }
+
+    footer {
+      margin-top: 28px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    footer a { color: var(--blue); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    code {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.9em;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="eyebrow">Chrome extension</div>
+    <h1>Google Meet Recorder <code>(Video + .vtt)</code></h1>
+    <p class="tagline">
+      Record a Google Meet tab. Keep the video. Keep the captions. Keep it on your machine.
+    </p>
+
+    <div class="pills">
+      <span class="pill blue">Chrome Extension</span>
+      <span class="pill green">Manifest V3</span>
+      <span class="pill red">Video · .webm</span>
+      <span class="pill yellow">Captions · .vtt</span>
+      <span class="pill">Saves locally</span>
+    </div>
+
+    <div class="cta">
+      <a class="btn btn-primary" href="https://github.com/Jassu78/google-meet-recorder-video-vtt/releases/latest">
+        Download latest release
+      </a>
+      <a class="btn btn-ghost" href="https://github.com/Jassu78/google-meet-recorder-video-vtt">
+        View on GitHub
+      </a>
+      <a class="btn btn-ghost" href="https://github.com/Jassu78/google-meet-recorder-video-vtt/blob/main/README.md">
+        Full README
+      </a>
+    </div>
+
+    <section class="panel">
+      <h2>What you get</h2>
+      <ul>
+        <li><code>Meet-Recording-….webm</code> — tab video + audio, captured locally</li>
+        <li><code>Meet-Transcript-….vtt</code> — text from Meet’s live captions (CC)</li>
+      </ul>
+      <div class="note">
+        This extension does not run its own speech-to-text. Captions come from Google Meet CC on the page; we save them. The video is yours, recorded in Chrome.
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Install in 30 seconds</h2>
+      <ol>
+        <li>Download the latest release zip and unzip it</li>
+        <li>Open <code>chrome://extensions</code> → enable <b>Developer mode</b></li>
+        <li><b>Load unpacked</b> → select the unzipped folder</li>
+        <li>Join Meet, turn on <b>CC</b>, hit Start Recording</li>
+      </ol>
+      <div class="note warn">
+        Want a <code>.vtt</code>? Turn captions on before you start. No CC on screen means video only.
+      </div>
+    </section>
+
+    <footer>
+      MIT ·
+      <a href="https://github.com/Jassu78/google-meet-recorder-video-vtt/issues/new/choose">Open an issue</a>
+      ·
+      <a href="https://github.com/Jassu78/google-meet-recorder-video-vtt">github.com/Jassu78/google-meet-recorder-video-vtt</a>
+    </footer>
+  </main>
+</body>
+</html>

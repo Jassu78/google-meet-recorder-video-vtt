@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build extension zip
+        id: pack
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          STAGE="google-meet-recorder-video-vtt-${VERSION}"
+          mkdir -p "dist/${STAGE}"
+          cp manifest.json background.js content.js offscreen.html offscreen.js popup.html popup.js "dist/${STAGE}/"
+          cd dist
+          zip -r "${STAGE}.zip" "${STAGE}"
+          echo "zip=${STAGE}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ steps.pack.outputs.zip }}
+          generate_release_notes: true
+          name: Google Meet Recorder ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Google Meet Recorder (Video + .vtt)",
+  "version": "1.0.0",
+  "minimum_chrome_version": "116",
+  "description": "Chrome extension that saves Google Meet tab video (.webm) and Meet captions (.vtt) to your Downloads folder.",
+  "permissions": [
+    "tabCapture",
+    "offscreen",
+    "storage",
+    "downloads",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://meet.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
