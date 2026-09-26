@@ -119,7 +119,35 @@ function sendToOffscreen(payload) {
   return chrome.runtime.sendMessage({ target: 'offscreen', ...payload });
 }
 
+const EXPECTED_CONTENT_VERSION = 5;
+
 async function ensureContentScript(tabId) {
+  let version = 0;
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { action: 'PING_CONTENT' });
+    if (response && response.success) {
+      version = Number(response.version) || 0;
+    }
+  } catch (_) {}
+
+  if (version >= EXPECTED_CONTENT_VERSION) {
+    return;
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        try {
+          if (typeof globalThis.__mlrDisposer === 'function') {
+            globalThis.__mlrDisposer();
+          }
+        } catch (_) {}
+        globalThis.__mlrBootVersion = 0;
+      }
+    });
+  } catch (_) {}
+
   await chrome.scripting.executeScript({
     target: { tabId },
     files: ['content.js']

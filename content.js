@@ -1,15 +1,15 @@
-const MLR_CONTENT_VERSION = 3;
+(function () {
+  var BOOT_VERSION = 5;
+  if (globalThis.__mlrBootVersion === BOOT_VERSION) {
+    return;
+  }
 
-if (globalThis.__mlrBootVersion === MLR_CONTENT_VERSION) {
-  // already running current content script
-} else {
-
-if (typeof globalThis.__mlrDisposer === 'function') {
-  try {
-    globalThis.__mlrDisposer();
-  } catch (_) {}
-}
-globalThis.__mlrBootVersion = MLR_CONTENT_VERSION;
+  if (typeof globalThis.__mlrDisposer === 'function') {
+    try {
+      globalThis.__mlrDisposer();
+    } catch (_) {}
+  }
+  globalThis.__mlrBootVersion = BOOT_VERSION;
 
 let captionObserver = null;
 let rootWatcher = null;
@@ -44,7 +44,7 @@ const SAME_CAPTION_SUPPRESS_MS = 120000;
 
 function onRuntimeMessage(request, _sender, sendResponse) {
   if (request.action === 'PING_CONTENT') {
-    sendResponse({ success: true, version: MLR_CONTENT_VERSION });
+    sendResponse({ success: true, version: BOOT_VERSION });
     return;
   }
 
@@ -60,7 +60,7 @@ function onRuntimeMessage(request, _sender, sendResponse) {
       initMuteMonitor();
       initLeaveMonitor();
       publishCaptionStatus('waiting', true);
-      sendResponse({ success: true, conversationMode, version: MLR_CONTENT_VERSION });
+      sendResponse({ success: true, conversationMode, version: BOOT_VERSION });
     });
     return true;
   }
@@ -953,6 +953,7 @@ globalThis.__mlrDisposer = () => {
     window.removeEventListener('pagehide', pageHideHandler);
     pageHideHandler = null;
   }
+  globalThis.__mlrBootVersion = 0;
 };
 
-}
+})();
