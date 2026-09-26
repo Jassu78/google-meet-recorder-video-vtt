@@ -218,6 +218,43 @@
     #captionStatus.visible { display: block; }
     #captionStatus.waiting { border-color: rgba(240, 180, 41, 0.35); color: var(--warn); }
     #captionStatus.live { border-color: rgba(61, 214, 140, 0.35); color: var(--accent); }
+
+    .setting-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin: 0 0 12px;
+      padding: 10px 10px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      text-align: left;
+    }
+
+    .setting-row input {
+      margin-top: 2px;
+      flex-shrink: 0;
+    }
+
+    .setting-row label {
+      font-size: 12px;
+      font-weight: 650;
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .setting-row .setting-hint {
+      margin-top: 4px;
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    .setting-row.disabled {
+      opacity: 0.45;
+      pointer-events: none;
+    }
   </style>
 </head>
 <body>
@@ -228,6 +265,14 @@
   <button id="stop" disabled>Stop Recording</button>
   <div id="status">Status: Idle</div>
   <div id="captionStatus"></div>
+
+  <div id="conversationRow" class="setting-row">
+    <input type="checkbox" id="conversationVtt" />
+    <div>
+      <label for="conversationVtt">Conversation VTT</label>
+      <div class="setting-hint">Optional. Cleaner speaker turns when people talk over each other. Off = current caption dump.</div>
+    </div>
+  </div>
 
   <div id="micPanel" class="mic-panel">
     <div class="mic-header">

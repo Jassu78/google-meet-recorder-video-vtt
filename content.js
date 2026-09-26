@@ -17,6 +17,16 @@ let transcriptBuffer = [];
 let captionLineCount = 0;
 let lastStatusKey = '';
 let persistTimer = null;
+let conversationMode = false;
+let openTurns = new Map();
+let turnByNodeId = new Map();
+let stabilityTimers = new Map();
+let nextTurnSeq = 1;
+
+const STABILITY_MS = 1500;
+const BARGE_IN_STABILITY_MS = 2500;
+const REMOUNT_REBIND_MS = 2500;
+const MIN_CUE_MS = 1000;
 
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   if (request.action === 'PING_CONTENT') {
@@ -28,16 +38,14 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     activeRecording = true;
     lastKnownMuted = null;
     meetEndSent = false;
-    activeBlocks.clear();
-    transcriptBuffer = [];
-    captionLineCount = 0;
-    lastStatusKey = '';
+    conversationMode = Boolean(request.conversationVtt);
+    resetCaptionState();
     showRecordingOverlay();
     startCaptionCapture();
     initMuteMonitor();
     initLeaveMonitor();
     publishCaptionStatus('waiting', true);
-    sendResponse({ success: true });
+    sendResponse({ success: true, conversationMode });
     return;
   }
 
@@ -50,10 +58,22 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     sendResponse({
       success: true,
       captionLineCount: transcriptBuffer.length,
-      transcript: transcriptBuffer.slice()
+      transcript: transcriptBuffer.slice(),
+      conversationMode
     });
   }
 });
+
+function resetCaptionState() {
+  activeBlocks.clear();
+  clearAllStabilityTimers();
+  openTurns.clear();
+  turnByNodeId.clear();
+  nextTurnSeq = 1;
+  transcriptBuffer = [];
+  captionLineCount = 0;
+  lastStatusKey = '';
+}
 
 function publishCaptionStatus(state, force) {
   const key = state + ':' + captionLineCount;
@@ -105,7 +125,10 @@ function teardown() {
     clearTimeout(persistTimer);
     persistTimer = null;
   }
+  clearAllStabilityTimers();
   activeBlocks.clear();
+  openTurns.clear();
+  turnByNodeId.clear();
 }
 
 function showRecordingOverlay() {
@@ -263,6 +286,244 @@ function isContinuation(previousText, nextText) {
   return false;
 }
 
+function isSoftRevision(previousText, nextText) {
+  if (isContinuation(previousText, nextText) || isContinuation(nextText, previousText)) {
+    return true;
+  }
+  const prev = normalizeCaptionText(previousText).toLowerCase();
+  const next = normalizeCaptionText(nextText).toLowerCase();
+  if (!prev || !next) {
+    return false;
+  }
+  let shared = 0;
+  const limit = Math.min(prev.length, next.length);
+  while (shared < limit && prev[shared] === next[shared]) {
+    shared += 1;
+  }
+  if (shared >= Math.max(16, Math.floor(Math.min(prev.length, next.length) * 0.45))) {
+    return true;
+  }
+  const prevWords = prev.split(/\s+/).filter(Boolean);
+  const nextWords = next.split(/\s+/).filter(Boolean);
+  if (prevWords.length >= 3 && nextWords.length >= 3) {
+    const nextSet = new Set(nextWords);
+    let hits = 0;
+    for (const word of prevWords) {
+      if (nextSet.has(word)) {
+        hits += 1;
+      }
+    }
+    if (hits / Math.max(prevWords.length, nextWords.length) >= 0.6) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function speakerLabel(author) {
+  const value = String(author || '').trim();
+  return value || 'Unknown';
+}
+
+function clearAllStabilityTimers() {
+  for (const timerId of stabilityTimers.values()) {
+    clearTimeout(timerId);
+  }
+  stabilityTimers.clear();
+}
+
+function clearStabilityTimer(turnId) {
+  const timerId = stabilityTimers.get(turnId);
+  if (timerId) {
+    clearTimeout(timerId);
+    stabilityTimers.delete(turnId);
+  }
+}
+
+function emitConversationCue(turn) {
+  const cleaned = normalizeCaptionText(turn.draft);
+  if (isNoise(turn.speaker, cleaned)) {
+    return;
+  }
+  const line = `${turn.speaker}: ${cleaned}`;
+  const endAt = Math.max(turn.lastUpdateMs, turn.startMs + MIN_CUE_MS);
+  const last = transcriptBuffer[transcriptBuffer.length - 1];
+  if (
+    last &&
+    last.mode === 'conversation' &&
+    last.author === turn.speaker &&
+    last.message === cleaned &&
+    last.at === turn.startMs
+  ) {
+    return;
+  }
+  transcriptBuffer.push({
+    at: turn.startMs,
+    endAt,
+    text: line,
+    author: turn.speaker,
+    message: cleaned,
+    mode: 'conversation'
+  });
+  captionLineCount = transcriptBuffer.length;
+  persistTranscript(false);
+  publishCaptionStatus('live');
+}
+
+function finalizeTurn(turnId) {
+  const turn = openTurns.get(turnId);
+  if (!turn) {
+    return;
+  }
+  clearStabilityTimer(turnId);
+  emitConversationCue(turn);
+  openTurns.delete(turnId);
+  if (turn.nodeId && turnByNodeId.get(turn.nodeId) === turnId) {
+    turnByNodeId.delete(turn.nodeId);
+  }
+  for (const [nodeId, id] of Array.from(turnByNodeId.entries())) {
+    if (id === turnId) {
+      turnByNodeId.delete(nodeId);
+    }
+  }
+}
+
+function scheduleStability(turnId) {
+  clearStabilityTimer(turnId);
+  if (!openTurns.has(turnId)) {
+    return;
+  }
+  const delay = openTurns.size > 1 ? BARGE_IN_STABILITY_MS : STABILITY_MS;
+  const timerId = setTimeout(() => {
+    stabilityTimers.delete(turnId);
+    if (activeRecording && openTurns.has(turnId)) {
+      finalizeTurn(turnId);
+    }
+  }, delay);
+  stabilityTimers.set(turnId, timerId);
+}
+
+function openConversationTurn(speaker, text, nodeId, now) {
+  const turnId = 't' + nextTurnSeq++;
+  const turn = {
+    turnId,
+    speaker,
+    draft: text,
+    startMs: now,
+    lastUpdateMs: now,
+    nodeId
+  };
+  openTurns.set(turnId, turn);
+  if (nodeId) {
+    turnByNodeId.set(nodeId, turnId);
+  }
+  scheduleStability(turnId);
+  return turn;
+}
+
+function findRebindTurn(speaker, text, now) {
+  for (const turn of openTurns.values()) {
+    if (turn.speaker !== speaker) {
+      continue;
+    }
+    if (now - turn.lastUpdateMs > REMOUNT_REBIND_MS) {
+      continue;
+    }
+    if (isSoftRevision(turn.draft, text)) {
+      return turn;
+    }
+  }
+  return null;
+}
+
+function observeConversationBlock(nodeId, author, text) {
+  const speaker = speakerLabel(author);
+  const now = Date.now();
+  let turnId = turnByNodeId.get(nodeId);
+  let turn = turnId ? openTurns.get(turnId) : null;
+
+  if (!turn) {
+    turn = findRebindTurn(speaker, text, now);
+    if (turn) {
+      turnId = turn.turnId;
+      turn.nodeId = nodeId;
+      turnByNodeId.set(nodeId, turnId);
+    }
+  }
+
+  if (!turn) {
+    openConversationTurn(speaker, text, nodeId, now);
+    publishLivePreview(speaker, text);
+    return;
+  }
+
+  if (turn.draft === text) {
+    return;
+  }
+
+  if (isSoftRevision(turn.draft, text)) {
+    turn.draft = text;
+    turn.lastUpdateMs = now;
+    scheduleStability(turn.turnId);
+    publishLivePreview(speaker, text);
+    return;
+  }
+
+  finalizeTurn(turn.turnId);
+  openConversationTurn(speaker, text, nodeId, now);
+  publishLivePreview(speaker, text);
+}
+
+function scanCaptionsConversation() {
+  const root = findCaptionRoot();
+  if (!root) {
+    publishCaptionStatus('waiting');
+    return;
+  }
+
+  const blocks = extractBlocks(root);
+  const seen = new Set();
+  let livePreview = 0;
+
+  for (const block of blocks) {
+    const key = blockKey(block);
+    seen.add(key);
+    const { author, text } = readBlock(block);
+    const cleaned = normalizeCaptionText(text);
+    if (!cleaned || isNoise(author, cleaned)) {
+      continue;
+    }
+    livePreview += 1;
+    observeConversationBlock(key, author, cleaned);
+  }
+
+  for (const [nodeId, turnId] of Array.from(turnByNodeId.entries())) {
+    if (!seen.has(nodeId)) {
+      turnByNodeId.delete(nodeId);
+      if (openTurns.has(turnId)) {
+        finalizeTurn(turnId);
+      }
+    }
+  }
+
+  if (livePreview > 0 || captionLineCount > 0 || openTurns.size > 0) {
+    publishCaptionStatus('live');
+  } else {
+    publishCaptionStatus('waiting');
+  }
+}
+
+function flushConversationTurns() {
+  const ids = Array.from(openTurns.keys());
+  for (const turnId of ids) {
+    finalizeTurn(turnId);
+  }
+  clearAllStabilityTimers();
+  openTurns.clear();
+  turnByNodeId.clear();
+  persistTranscript(true);
+}
+
 function persistTranscript(immediate) {
   captionLineCount = transcriptBuffer.length;
   const write = () => {
@@ -317,6 +578,11 @@ function scanCaptions() {
   if (!activeRecording) {
     return;
   }
+  if (conversationMode) {
+    scanCaptionsConversation();
+    return;
+  }
+
   const root = findCaptionRoot();
   if (!root) {
     publishCaptionStatus('waiting');
@@ -392,6 +658,10 @@ function publishLivePreview(author, text) {
 }
 
 function flushActiveBlocks() {
+  if (conversationMode) {
+    flushConversationTurns();
+    return;
+  }
   for (const entry of activeBlocks.values()) {
     commitLine(entry.author, entry.text);
   }
