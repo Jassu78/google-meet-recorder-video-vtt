@@ -1,4 +1,4 @@
-const MLR_CONTENT_VERSION = 2;
+const MLR_CONTENT_VERSION = 3;
 
 if (globalThis.__mlrBootVersion === MLR_CONTENT_VERSION) {
   // already running current content script
@@ -32,13 +32,15 @@ let openTurns = new Map();
 let turnByNodeId = new Map();
 let stabilityTimers = new Map();
 let orphanTimers = new Map();
+let lastFinalBySpeaker = new Map();
 let nextTurnSeq = 1;
 let pageHideHandler = null;
 
-const STABILITY_MS = 1500;
-const BARGE_IN_STABILITY_MS = 2500;
-const REMOUNT_REBIND_MS = 2800;
+const STABILITY_MS = 1800;
+const BARGE_IN_STABILITY_MS = 2800;
+const REMOUNT_REBIND_MS = 3200;
 const MIN_CUE_MS = 1000;
+const SAME_CAPTION_SUPPRESS_MS = 120000;
 
 function onRuntimeMessage(request, _sender, sendResponse) {
   if (request.action === 'PING_CONTENT') {
@@ -86,6 +88,7 @@ function resetCaptionState() {
   clearAllOrphanTimers();
   openTurns.clear();
   turnByNodeId.clear();
+  lastFinalBySpeaker.clear();
   nextTurnSeq = 1;
   transcriptBuffer = [];
   captionLineCount = 0;
@@ -401,26 +404,48 @@ function emitConversationCue(turn) {
   if (isNoise(turn.speaker, cleaned)) {
     return;
   }
+  const compact = compactCaption(cleaned);
   const line = `${turn.speaker}: ${cleaned}`;
   const endAt = Math.max(turn.lastUpdateMs, turn.startMs + MIN_CUE_MS);
-  const last = transcriptBuffer[transcriptBuffer.length - 1];
-  if (
-    last &&
-    last.mode === 'conversation' &&
-    last.author === turn.speaker &&
-    last.message === cleaned &&
-    last.at === turn.startMs
-  ) {
+  const prevFinal = lastFinalBySpeaker.get(turn.speaker);
+  if (prevFinal && compactCaption(prevFinal.message) === compact) {
+    if (typeof prevFinal.endAt === 'number') {
+      prevFinal.endAt = Math.max(prevFinal.endAt, endAt);
+    }
     return;
   }
-  transcriptBuffer.push({
+
+  for (let i = transcriptBuffer.length - 1; i >= 0; i--) {
+    const prev = transcriptBuffer[i];
+    if (!prev || prev.mode !== 'conversation') {
+      continue;
+    }
+    if (prev.author !== turn.speaker) {
+      break;
+    }
+    if (compactCaption(prev.message) === compact || isSoftRevision(prev.message, cleaned)) {
+      prev.message = cleaned;
+      prev.text = line;
+      prev.endAt = Math.max(typeof prev.endAt === 'number' ? prev.endAt : prev.at, endAt);
+      lastFinalBySpeaker.set(turn.speaker, prev);
+      captionLineCount = transcriptBuffer.length;
+      persistTranscript(false);
+      publishCaptionStatus('live');
+      return;
+    }
+    break;
+  }
+
+  const entry = {
     at: turn.startMs,
     endAt,
     text: line,
     author: turn.speaker,
     message: cleaned,
     mode: 'conversation'
-  });
+  };
+  transcriptBuffer.push(entry);
+  lastFinalBySpeaker.set(turn.speaker, entry);
   captionLineCount = transcriptBuffer.length;
   persistTranscript(false);
   publishCaptionStatus('live');
@@ -453,11 +478,35 @@ function scheduleStability(turnId) {
   const delay = openTurns.size > 1 ? BARGE_IN_STABILITY_MS : STABILITY_MS;
   const timerId = setTimeout(() => {
     stabilityTimers.delete(turnId);
-    if (activeRecording && openTurns.has(turnId)) {
-      finalizeTurn(turnId);
+    const turn = openTurns.get(turnId);
+    if (!activeRecording || !turn) {
+      return;
     }
+    if (turn.nodeId) {
+      return;
+    }
+    finalizeTurn(turnId);
   }, delay);
   stabilityTimers.set(turnId, timerId);
+}
+
+function reviveFinalAsOpenTurn(speaker, text, nodeId, now, prevFinal) {
+  for (let i = transcriptBuffer.length - 1; i >= 0; i--) {
+    const prev = transcriptBuffer[i];
+    if (!prev || prev.mode !== 'conversation' || prev.author !== speaker) {
+      continue;
+    }
+    if (prev === prevFinal || compactCaption(prev.message) === compactCaption(prevFinal.message)) {
+      transcriptBuffer.splice(i, 1);
+      break;
+    }
+    break;
+  }
+  lastFinalBySpeaker.delete(speaker);
+  captionLineCount = transcriptBuffer.length;
+  const turn = openConversationTurn(speaker, text, nodeId, prevFinal.at || now);
+  turn.lastUpdateMs = now;
+  return turn;
 }
 
 function openConversationTurn(speaker, text, nodeId, now) {
@@ -517,6 +566,20 @@ function observeConversationBlock(nodeId, author, text) {
   }
 
   if (!turn) {
+    const prevFinal = lastFinalBySpeaker.get(speaker);
+    if (prevFinal) {
+      const sameText = compactCaption(prevFinal.message) === compactCaption(text);
+      const recent = now - (prevFinal.endAt || prevFinal.at || 0) < SAME_CAPTION_SUPPRESS_MS;
+      if (sameText && recent) {
+        publishLivePreview(speaker, text);
+        return;
+      }
+      if (recent && isContinuation(prevFinal.message, text)) {
+        turn = reviveFinalAsOpenTurn(speaker, text, nodeId, now, prevFinal);
+        publishLivePreview(speaker, text);
+        return;
+      }
+    }
     openConversationTurn(speaker, text, nodeId, now);
     publishLivePreview(speaker, text);
     return;
