@@ -83,6 +83,9 @@ startBtn.addEventListener('click', () => {
     if (response && response.success) {
       toggleUI(true);
       startMeterLoop();
+      if (response.conversationMode || response.conversationVtt) {
+        statusDiv.innerText = 'Status: Recording… (Conversation VTT on)';
+      }
       return;
     }
     toggleUI(false);

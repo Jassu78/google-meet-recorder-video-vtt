@@ -1,5 +1,15 @@
-if (!globalThis.__meetLocalRecorderLoaded) {
-globalThis.__meetLocalRecorderLoaded = true;
+const MLR_CONTENT_VERSION = 2;
+
+if (globalThis.__mlrBootVersion === MLR_CONTENT_VERSION) {
+  // already running current content script
+} else {
+
+if (typeof globalThis.__mlrDisposer === 'function') {
+  try {
+    globalThis.__mlrDisposer();
+  } catch (_) {}
+}
+globalThis.__mlrBootVersion = MLR_CONTENT_VERSION;
 
 let captionObserver = null;
 let rootWatcher = null;
@@ -21,32 +31,36 @@ let conversationMode = false;
 let openTurns = new Map();
 let turnByNodeId = new Map();
 let stabilityTimers = new Map();
+let orphanTimers = new Map();
 let nextTurnSeq = 1;
+let pageHideHandler = null;
 
 const STABILITY_MS = 1500;
 const BARGE_IN_STABILITY_MS = 2500;
-const REMOUNT_REBIND_MS = 2500;
+const REMOUNT_REBIND_MS = 2800;
 const MIN_CUE_MS = 1000;
 
-chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+function onRuntimeMessage(request, _sender, sendResponse) {
   if (request.action === 'PING_CONTENT') {
-    sendResponse({ success: true });
+    sendResponse({ success: true, version: MLR_CONTENT_VERSION });
     return;
   }
 
   if (request.action === 'START_SCRAPING') {
-    activeRecording = true;
-    lastKnownMuted = null;
-    meetEndSent = false;
-    conversationMode = Boolean(request.conversationVtt);
-    resetCaptionState();
-    showRecordingOverlay();
-    startCaptionCapture();
-    initMuteMonitor();
-    initLeaveMonitor();
-    publishCaptionStatus('waiting', true);
-    sendResponse({ success: true, conversationMode });
-    return;
+    chrome.storage.local.get(['conversationVtt'], (stored) => {
+      activeRecording = true;
+      lastKnownMuted = null;
+      meetEndSent = false;
+      conversationMode = Boolean(request.conversationVtt) || Boolean(stored.conversationVtt);
+      resetCaptionState();
+      showRecordingOverlay();
+      startCaptionCapture();
+      initMuteMonitor();
+      initLeaveMonitor();
+      publishCaptionStatus('waiting', true);
+      sendResponse({ success: true, conversationMode, version: MLR_CONTENT_VERSION });
+    });
+    return true;
   }
 
   if (request.action === 'STOP_SCRAPING') {
@@ -62,11 +76,14 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       conversationMode
     });
   }
-});
+}
+
+chrome.runtime.onMessage.addListener(onRuntimeMessage);
 
 function resetCaptionState() {
   activeBlocks.clear();
   clearAllStabilityTimers();
+  clearAllOrphanTimers();
   openTurns.clear();
   turnByNodeId.clear();
   nextTurnSeq = 1;
@@ -126,6 +143,7 @@ function teardown() {
     persistTimer = null;
   }
   clearAllStabilityTimers();
+  clearAllOrphanTimers();
   activeBlocks.clear();
   openTurns.clear();
   turnByNodeId.clear();
@@ -152,7 +170,8 @@ function showRecordingOverlay() {
     'box-shadow:0 4px 16px rgba(0,0,0,.35)',
     'pointer-events:none'
   ].join(';');
-  overlayEl.innerHTML = '<span style="width:8px;height:8px;border-radius:50%;background:#ea4335;display:inline-block"></span><span>Recording</span><span id="mlr-cap-hint" style="font-weight:500;color:#bdc1c6"></span>';
+  const modeTag = conversationMode ? '<span style="font-weight:500;color:#81c995">· conversation VTT</span>' : '';
+  overlayEl.innerHTML = '<span style="width:8px;height:8px;border-radius:50%;background:#ea4335;display:inline-block"></span><span>Recording</span>' + modeTag + '<span id="mlr-cap-hint" style="font-weight:500;color:#bdc1c6"></span>';
   document.documentElement.appendChild(overlayEl);
   updateOverlayCaptionHint('waiting');
 }
@@ -264,9 +283,17 @@ function normalizeCaptionText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
+function compactCaption(text) {
+  return normalizeCaptionText(text)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function isContinuation(previousText, nextText) {
-  const prev = normalizeCaptionText(previousText).toLowerCase();
-  const next = normalizeCaptionText(nextText).toLowerCase();
+  const prev = compactCaption(previousText);
+  const next = compactCaption(nextText);
   if (!prev || !next) {
     return false;
   }
@@ -276,11 +303,11 @@ function isContinuation(previousText, nextText) {
   if (next.startsWith(prev)) {
     return true;
   }
-  if (prev.startsWith(next) && next.length >= Math.max(8, Math.floor(prev.length * 0.6))) {
+  if (prev.startsWith(next) && next.length >= Math.max(6, Math.floor(prev.length * 0.55))) {
     return true;
   }
   const prevTail = prev.slice(-40);
-  if (prevTail.length >= 12 && next.includes(prevTail)) {
+  if (prevTail.length >= 8 && next.includes(prevTail)) {
     return true;
   }
   return false;
@@ -290,8 +317,8 @@ function isSoftRevision(previousText, nextText) {
   if (isContinuation(previousText, nextText) || isContinuation(nextText, previousText)) {
     return true;
   }
-  const prev = normalizeCaptionText(previousText).toLowerCase();
-  const next = normalizeCaptionText(nextText).toLowerCase();
+  const prev = compactCaption(previousText);
+  const next = compactCaption(nextText);
   if (!prev || !next) {
     return false;
   }
@@ -300,12 +327,12 @@ function isSoftRevision(previousText, nextText) {
   while (shared < limit && prev[shared] === next[shared]) {
     shared += 1;
   }
-  if (shared >= Math.max(16, Math.floor(Math.min(prev.length, next.length) * 0.45))) {
+  if (shared >= Math.max(8, Math.floor(Math.min(prev.length, next.length) * 0.4))) {
     return true;
   }
   const prevWords = prev.split(/\s+/).filter(Boolean);
   const nextWords = next.split(/\s+/).filter(Boolean);
-  if (prevWords.length >= 3 && nextWords.length >= 3) {
+  if (prevWords.length && nextWords.length) {
     const nextSet = new Set(nextWords);
     let hits = 0;
     for (const word of prevWords) {
@@ -313,7 +340,8 @@ function isSoftRevision(previousText, nextText) {
         hits += 1;
       }
     }
-    if (hits / Math.max(prevWords.length, nextWords.length) >= 0.6) {
+    const ratio = hits / Math.max(prevWords.length, nextWords.length);
+    if (ratio >= 0.5 || (prevWords.length <= 3 && hits >= 1 && next.startsWith(prevWords[0]))) {
       return true;
     }
   }
@@ -332,12 +360,40 @@ function clearAllStabilityTimers() {
   stabilityTimers.clear();
 }
 
+function clearAllOrphanTimers() {
+  for (const timerId of orphanTimers.values()) {
+    clearTimeout(timerId);
+  }
+  orphanTimers.clear();
+}
+
 function clearStabilityTimer(turnId) {
   const timerId = stabilityTimers.get(turnId);
   if (timerId) {
     clearTimeout(timerId);
     stabilityTimers.delete(turnId);
   }
+}
+
+function clearOrphanTimer(turnId) {
+  const timerId = orphanTimers.get(turnId);
+  if (timerId) {
+    clearTimeout(timerId);
+    orphanTimers.delete(turnId);
+  }
+}
+
+function markTurnOrphaned(turnId) {
+  if (!openTurns.has(turnId) || orphanTimers.has(turnId)) {
+    return;
+  }
+  const timerId = setTimeout(() => {
+    orphanTimers.delete(turnId);
+    if (activeRecording && openTurns.has(turnId)) {
+      finalizeTurn(turnId);
+    }
+  }, REMOUNT_REBIND_MS);
+  orphanTimers.set(turnId, timerId);
 }
 
 function emitConversationCue(turn) {
@@ -376,6 +432,7 @@ function finalizeTurn(turnId) {
     return;
   }
   clearStabilityTimer(turnId);
+  clearOrphanTimer(turnId);
   emitConversationCue(turn);
   openTurns.delete(turnId);
   if (turn.nodeId && turnByNodeId.get(turn.nodeId) === turnId) {
@@ -422,6 +479,7 @@ function openConversationTurn(speaker, text, nodeId, now) {
 }
 
 function findRebindTurn(speaker, text, now) {
+  const candidates = [];
   for (const turn of openTurns.values()) {
     if (turn.speaker !== speaker) {
       continue;
@@ -429,9 +487,15 @@ function findRebindTurn(speaker, text, now) {
     if (now - turn.lastUpdateMs > REMOUNT_REBIND_MS) {
       continue;
     }
+    candidates.push(turn);
+  }
+  for (const turn of candidates) {
     if (isSoftRevision(turn.draft, text)) {
       return turn;
     }
+  }
+  if (candidates.length === 1) {
+    return candidates[0];
   }
   return null;
 }
@@ -448,6 +512,7 @@ function observeConversationBlock(nodeId, author, text) {
       turnId = turn.turnId;
       turn.nodeId = nodeId;
       turnByNodeId.set(nodeId, turnId);
+      clearOrphanTimer(turnId);
     }
   }
 
@@ -456,6 +521,8 @@ function observeConversationBlock(nodeId, author, text) {
     publishLivePreview(speaker, text);
     return;
   }
+
+  clearOrphanTimer(turn.turnId);
 
   if (turn.draft === text) {
     return;
@@ -501,7 +568,11 @@ function scanCaptionsConversation() {
     if (!seen.has(nodeId)) {
       turnByNodeId.delete(nodeId);
       if (openTurns.has(turnId)) {
-        finalizeTurn(turnId);
+        const turn = openTurns.get(turnId);
+        if (turn) {
+          turn.nodeId = null;
+        }
+        markTurnOrphaned(turnId);
       }
     }
   }
@@ -519,6 +590,7 @@ function flushConversationTurns() {
     finalizeTurn(turnId);
   }
   clearAllStabilityTimers();
+  clearAllOrphanTimers();
   openTurns.clear();
   turnByNodeId.clear();
   persistTranscript(true);
@@ -801,10 +873,23 @@ function initLeaveMonitor() {
   }, 1000);
 }
 
-window.addEventListener('pagehide', () => {
+window.addEventListener('pagehide', pageHideHandler = () => {
   if (activeRecording) {
     notifyMeetEnded();
   }
 });
+
+globalThis.__mlrDisposer = () => {
+  try {
+    chrome.runtime.onMessage.removeListener(onRuntimeMessage);
+  } catch (_) {}
+  activeRecording = false;
+  teardown();
+  hideRecordingOverlay();
+  if (pageHideHandler) {
+    window.removeEventListener('pagehide', pageHideHandler);
+    pageHideHandler = null;
+  }
+};
 
 }

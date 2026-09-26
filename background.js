@@ -120,13 +120,6 @@ function sendToOffscreen(payload) {
 }
 
 async function ensureContentScript(tabId) {
-  try {
-    const response = await chrome.tabs.sendMessage(tabId, { action: 'PING_CONTENT' });
-    if (response && response.success) {
-      return;
-    }
-  } catch (_) {}
-
   await chrome.scripting.executeScript({
     target: { tabId },
     files: ['content.js']
@@ -284,14 +277,17 @@ async function startRecordingSequence() {
 
     await ensureContentScript(tab.id);
     const settings = await chrome.storage.local.get(['conversationVtt']);
-    chrome.tabs.sendMessage(tab.id, {
+    const conversationVtt = Boolean(settings.conversationVtt);
+    const scrapeResult = await chrome.tabs.sendMessage(tab.id, {
       action: 'START_SCRAPING',
-      conversationVtt: Boolean(settings.conversationVtt)
-    }).catch(() => {});
+      conversationVtt
+    }).catch(() => null);
 
     return {
       hasMic: Boolean(startResult.hasMic),
-      audioTracks: startResult.audioTracks || 0
+      audioTracks: startResult.audioTracks || 0,
+      conversationMode: Boolean(scrapeResult && scrapeResult.conversationMode),
+      conversationVtt
     };
   } catch (err) {
     await chrome.storage.local.set({
