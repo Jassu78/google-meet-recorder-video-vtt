@@ -8,15 +8,37 @@ const meterFill = document.getElementById('meterFill');
 const meterHint = document.getElementById('meterHint');
 const recBanner = document.getElementById('recBanner');
 const captionStatus = document.getElementById('captionStatus');
+const conversationVtt = document.getElementById('conversationVtt');
+const conversationRow = document.getElementById('conversationRow');
 
 let animationFrameId = null;
 let displayedLevel = 0;
 
+function setConversationEnabled(enabled) {
+  if (conversationRow) {
+    conversationRow.classList.toggle('disabled', !enabled);
+  }
+  if (conversationVtt) {
+    conversationVtt.disabled = !enabled;
+  }
+}
+
+if (conversationVtt) {
+  conversationVtt.addEventListener('change', () => {
+    chrome.storage.local.set({ conversationVtt: Boolean(conversationVtt.checked) });
+  });
+}
+
 function refreshFromStorage() {
-  chrome.storage.local.get(['isRecording', 'captionStatus'], (result) => {
+  chrome.storage.local.get(['isRecording', 'captionStatus', 'conversationVtt'], (result) => {
+    if (conversationVtt) {
+      conversationVtt.checked = Boolean(result.conversationVtt);
+    }
     if (result.isRecording) {
       toggleUI(true);
       startMeterLoop();
+    } else {
+      setConversationEnabled(true);
     }
     renderCaptionStatus(result.captionStatus);
   });
@@ -61,6 +83,9 @@ startBtn.addEventListener('click', () => {
     if (response && response.success) {
       toggleUI(true);
       startMeterLoop();
+      if (response.conversationMode || response.conversationVtt) {
+        statusDiv.innerText = 'Status: Recording… (Conversation VTT on)';
+      }
       return;
     }
     toggleUI(false);
@@ -125,6 +150,7 @@ function toggleUI(recording) {
   statusDiv.innerText = recording ? 'Status: Recording…' : 'Status: Idle';
   micPanel.classList.toggle('visible', recording);
   recBanner.classList.toggle('visible', recording);
+  setConversationEnabled(!recording);
   if (recording) {
     renderCaptionStatus({ state: 'waiting', lines: 0 });
   } else {

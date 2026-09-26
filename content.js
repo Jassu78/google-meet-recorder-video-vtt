@@ -1,5 +1,15 @@
-if (!globalThis.__meetLocalRecorderLoaded) {
-globalThis.__meetLocalRecorderLoaded = true;
+(function () {
+  var BOOT_VERSION = 5;
+  if (globalThis.__mlrBootVersion === BOOT_VERSION) {
+    return;
+  }
+
+  if (typeof globalThis.__mlrDisposer === 'function') {
+    try {
+      globalThis.__mlrDisposer();
+    } catch (_) {}
+  }
+  globalThis.__mlrBootVersion = BOOT_VERSION;
 
 let captionObserver = null;
 let rootWatcher = null;
@@ -17,28 +27,42 @@ let transcriptBuffer = [];
 let captionLineCount = 0;
 let lastStatusKey = '';
 let persistTimer = null;
+let conversationMode = false;
+let openTurns = new Map();
+let turnByNodeId = new Map();
+let stabilityTimers = new Map();
+let orphanTimers = new Map();
+let lastFinalBySpeaker = new Map();
+let nextTurnSeq = 1;
+let pageHideHandler = null;
 
-chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+const STABILITY_MS = 1800;
+const BARGE_IN_STABILITY_MS = 2800;
+const REMOUNT_REBIND_MS = 3200;
+const MIN_CUE_MS = 1000;
+const SAME_CAPTION_SUPPRESS_MS = 120000;
+
+function onRuntimeMessage(request, _sender, sendResponse) {
   if (request.action === 'PING_CONTENT') {
-    sendResponse({ success: true });
+    sendResponse({ success: true, version: BOOT_VERSION });
     return;
   }
 
   if (request.action === 'START_SCRAPING') {
-    activeRecording = true;
-    lastKnownMuted = null;
-    meetEndSent = false;
-    activeBlocks.clear();
-    transcriptBuffer = [];
-    captionLineCount = 0;
-    lastStatusKey = '';
-    showRecordingOverlay();
-    startCaptionCapture();
-    initMuteMonitor();
-    initLeaveMonitor();
-    publishCaptionStatus('waiting', true);
-    sendResponse({ success: true });
-    return;
+    chrome.storage.local.get(['conversationVtt'], (stored) => {
+      activeRecording = true;
+      lastKnownMuted = null;
+      meetEndSent = false;
+      conversationMode = Boolean(request.conversationVtt) || Boolean(stored.conversationVtt);
+      resetCaptionState();
+      showRecordingOverlay();
+      startCaptionCapture();
+      initMuteMonitor();
+      initLeaveMonitor();
+      publishCaptionStatus('waiting', true);
+      sendResponse({ success: true, conversationMode, version: BOOT_VERSION });
+    });
+    return true;
   }
 
   if (request.action === 'STOP_SCRAPING') {
@@ -50,10 +74,26 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     sendResponse({
       success: true,
       captionLineCount: transcriptBuffer.length,
-      transcript: transcriptBuffer.slice()
+      transcript: transcriptBuffer.slice(),
+      conversationMode
     });
   }
-});
+}
+
+chrome.runtime.onMessage.addListener(onRuntimeMessage);
+
+function resetCaptionState() {
+  activeBlocks.clear();
+  clearAllStabilityTimers();
+  clearAllOrphanTimers();
+  openTurns.clear();
+  turnByNodeId.clear();
+  lastFinalBySpeaker.clear();
+  nextTurnSeq = 1;
+  transcriptBuffer = [];
+  captionLineCount = 0;
+  lastStatusKey = '';
+}
 
 function publishCaptionStatus(state, force) {
   const key = state + ':' + captionLineCount;
@@ -105,7 +145,11 @@ function teardown() {
     clearTimeout(persistTimer);
     persistTimer = null;
   }
+  clearAllStabilityTimers();
+  clearAllOrphanTimers();
   activeBlocks.clear();
+  openTurns.clear();
+  turnByNodeId.clear();
 }
 
 function showRecordingOverlay() {
@@ -129,7 +173,8 @@ function showRecordingOverlay() {
     'box-shadow:0 4px 16px rgba(0,0,0,.35)',
     'pointer-events:none'
   ].join(';');
-  overlayEl.innerHTML = '<span style="width:8px;height:8px;border-radius:50%;background:#ea4335;display:inline-block"></span><span>Recording</span><span id="mlr-cap-hint" style="font-weight:500;color:#bdc1c6"></span>';
+  const modeTag = conversationMode ? '<span style="font-weight:500;color:#81c995">· conversation VTT</span>' : '';
+  overlayEl.innerHTML = '<span style="width:8px;height:8px;border-radius:50%;background:#ea4335;display:inline-block"></span><span>Recording</span>' + modeTag + '<span id="mlr-cap-hint" style="font-weight:500;color:#bdc1c6"></span>';
   document.documentElement.appendChild(overlayEl);
   updateOverlayCaptionHint('waiting');
 }
@@ -241,9 +286,17 @@ function normalizeCaptionText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
+function compactCaption(text) {
+  return normalizeCaptionText(text)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function isContinuation(previousText, nextText) {
-  const prev = normalizeCaptionText(previousText).toLowerCase();
-  const next = normalizeCaptionText(nextText).toLowerCase();
+  const prev = compactCaption(previousText);
+  const next = compactCaption(nextText);
   if (!prev || !next) {
     return false;
   }
@@ -253,14 +306,357 @@ function isContinuation(previousText, nextText) {
   if (next.startsWith(prev)) {
     return true;
   }
-  if (prev.startsWith(next) && next.length >= Math.max(8, Math.floor(prev.length * 0.6))) {
+  if (prev.startsWith(next) && next.length >= Math.max(6, Math.floor(prev.length * 0.55))) {
     return true;
   }
   const prevTail = prev.slice(-40);
-  if (prevTail.length >= 12 && next.includes(prevTail)) {
+  if (prevTail.length >= 8 && next.includes(prevTail)) {
     return true;
   }
   return false;
+}
+
+function isSoftRevision(previousText, nextText) {
+  if (isContinuation(previousText, nextText) || isContinuation(nextText, previousText)) {
+    return true;
+  }
+  const prev = compactCaption(previousText);
+  const next = compactCaption(nextText);
+  if (!prev || !next) {
+    return false;
+  }
+  let shared = 0;
+  const limit = Math.min(prev.length, next.length);
+  while (shared < limit && prev[shared] === next[shared]) {
+    shared += 1;
+  }
+  if (shared >= Math.max(8, Math.floor(Math.min(prev.length, next.length) * 0.4))) {
+    return true;
+  }
+  const prevWords = prev.split(/\s+/).filter(Boolean);
+  const nextWords = next.split(/\s+/).filter(Boolean);
+  if (prevWords.length && nextWords.length) {
+    const nextSet = new Set(nextWords);
+    let hits = 0;
+    for (const word of prevWords) {
+      if (nextSet.has(word)) {
+        hits += 1;
+      }
+    }
+    const ratio = hits / Math.max(prevWords.length, nextWords.length);
+    if (ratio >= 0.5 || (prevWords.length <= 3 && hits >= 1 && next.startsWith(prevWords[0]))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function speakerLabel(author) {
+  const value = String(author || '').trim();
+  return value || 'Unknown';
+}
+
+function clearAllStabilityTimers() {
+  for (const timerId of stabilityTimers.values()) {
+    clearTimeout(timerId);
+  }
+  stabilityTimers.clear();
+}
+
+function clearAllOrphanTimers() {
+  for (const timerId of orphanTimers.values()) {
+    clearTimeout(timerId);
+  }
+  orphanTimers.clear();
+}
+
+function clearStabilityTimer(turnId) {
+  const timerId = stabilityTimers.get(turnId);
+  if (timerId) {
+    clearTimeout(timerId);
+    stabilityTimers.delete(turnId);
+  }
+}
+
+function clearOrphanTimer(turnId) {
+  const timerId = orphanTimers.get(turnId);
+  if (timerId) {
+    clearTimeout(timerId);
+    orphanTimers.delete(turnId);
+  }
+}
+
+function markTurnOrphaned(turnId) {
+  if (!openTurns.has(turnId) || orphanTimers.has(turnId)) {
+    return;
+  }
+  const timerId = setTimeout(() => {
+    orphanTimers.delete(turnId);
+    if (activeRecording && openTurns.has(turnId)) {
+      finalizeTurn(turnId);
+    }
+  }, REMOUNT_REBIND_MS);
+  orphanTimers.set(turnId, timerId);
+}
+
+function emitConversationCue(turn) {
+  const cleaned = normalizeCaptionText(turn.draft);
+  if (isNoise(turn.speaker, cleaned)) {
+    return;
+  }
+  const compact = compactCaption(cleaned);
+  const line = `${turn.speaker}: ${cleaned}`;
+  const endAt = Math.max(turn.lastUpdateMs, turn.startMs + MIN_CUE_MS);
+  const prevFinal = lastFinalBySpeaker.get(turn.speaker);
+  if (prevFinal && compactCaption(prevFinal.message) === compact) {
+    if (typeof prevFinal.endAt === 'number') {
+      prevFinal.endAt = Math.max(prevFinal.endAt, endAt);
+    }
+    return;
+  }
+
+  for (let i = transcriptBuffer.length - 1; i >= 0; i--) {
+    const prev = transcriptBuffer[i];
+    if (!prev || prev.mode !== 'conversation') {
+      continue;
+    }
+    if (prev.author !== turn.speaker) {
+      break;
+    }
+    if (compactCaption(prev.message) === compact || isSoftRevision(prev.message, cleaned)) {
+      prev.message = cleaned;
+      prev.text = line;
+      prev.endAt = Math.max(typeof prev.endAt === 'number' ? prev.endAt : prev.at, endAt);
+      lastFinalBySpeaker.set(turn.speaker, prev);
+      captionLineCount = transcriptBuffer.length;
+      persistTranscript(false);
+      publishCaptionStatus('live');
+      return;
+    }
+    break;
+  }
+
+  const entry = {
+    at: turn.startMs,
+    endAt,
+    text: line,
+    author: turn.speaker,
+    message: cleaned,
+    mode: 'conversation'
+  };
+  transcriptBuffer.push(entry);
+  lastFinalBySpeaker.set(turn.speaker, entry);
+  captionLineCount = transcriptBuffer.length;
+  persistTranscript(false);
+  publishCaptionStatus('live');
+}
+
+function finalizeTurn(turnId) {
+  const turn = openTurns.get(turnId);
+  if (!turn) {
+    return;
+  }
+  clearStabilityTimer(turnId);
+  clearOrphanTimer(turnId);
+  emitConversationCue(turn);
+  openTurns.delete(turnId);
+  if (turn.nodeId && turnByNodeId.get(turn.nodeId) === turnId) {
+    turnByNodeId.delete(turn.nodeId);
+  }
+  for (const [nodeId, id] of Array.from(turnByNodeId.entries())) {
+    if (id === turnId) {
+      turnByNodeId.delete(nodeId);
+    }
+  }
+}
+
+function scheduleStability(turnId) {
+  clearStabilityTimer(turnId);
+  if (!openTurns.has(turnId)) {
+    return;
+  }
+  const delay = openTurns.size > 1 ? BARGE_IN_STABILITY_MS : STABILITY_MS;
+  const timerId = setTimeout(() => {
+    stabilityTimers.delete(turnId);
+    const turn = openTurns.get(turnId);
+    if (!activeRecording || !turn) {
+      return;
+    }
+    if (turn.nodeId) {
+      return;
+    }
+    finalizeTurn(turnId);
+  }, delay);
+  stabilityTimers.set(turnId, timerId);
+}
+
+function reviveFinalAsOpenTurn(speaker, text, nodeId, now, prevFinal) {
+  for (let i = transcriptBuffer.length - 1; i >= 0; i--) {
+    const prev = transcriptBuffer[i];
+    if (!prev || prev.mode !== 'conversation' || prev.author !== speaker) {
+      continue;
+    }
+    if (prev === prevFinal || compactCaption(prev.message) === compactCaption(prevFinal.message)) {
+      transcriptBuffer.splice(i, 1);
+      break;
+    }
+    break;
+  }
+  lastFinalBySpeaker.delete(speaker);
+  captionLineCount = transcriptBuffer.length;
+  const turn = openConversationTurn(speaker, text, nodeId, prevFinal.at || now);
+  turn.lastUpdateMs = now;
+  return turn;
+}
+
+function openConversationTurn(speaker, text, nodeId, now) {
+  const turnId = 't' + nextTurnSeq++;
+  const turn = {
+    turnId,
+    speaker,
+    draft: text,
+    startMs: now,
+    lastUpdateMs: now,
+    nodeId
+  };
+  openTurns.set(turnId, turn);
+  if (nodeId) {
+    turnByNodeId.set(nodeId, turnId);
+  }
+  scheduleStability(turnId);
+  return turn;
+}
+
+function findRebindTurn(speaker, text, now) {
+  const candidates = [];
+  for (const turn of openTurns.values()) {
+    if (turn.speaker !== speaker) {
+      continue;
+    }
+    if (now - turn.lastUpdateMs > REMOUNT_REBIND_MS) {
+      continue;
+    }
+    candidates.push(turn);
+  }
+  for (const turn of candidates) {
+    if (isSoftRevision(turn.draft, text)) {
+      return turn;
+    }
+  }
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+  return null;
+}
+
+function observeConversationBlock(nodeId, author, text) {
+  const speaker = speakerLabel(author);
+  const now = Date.now();
+  let turnId = turnByNodeId.get(nodeId);
+  let turn = turnId ? openTurns.get(turnId) : null;
+
+  if (!turn) {
+    turn = findRebindTurn(speaker, text, now);
+    if (turn) {
+      turnId = turn.turnId;
+      turn.nodeId = nodeId;
+      turnByNodeId.set(nodeId, turnId);
+      clearOrphanTimer(turnId);
+    }
+  }
+
+  if (!turn) {
+    const prevFinal = lastFinalBySpeaker.get(speaker);
+    if (prevFinal) {
+      const sameText = compactCaption(prevFinal.message) === compactCaption(text);
+      const recent = now - (prevFinal.endAt || prevFinal.at || 0) < SAME_CAPTION_SUPPRESS_MS;
+      if (sameText && recent) {
+        publishLivePreview(speaker, text);
+        return;
+      }
+      if (recent && isContinuation(prevFinal.message, text)) {
+        turn = reviveFinalAsOpenTurn(speaker, text, nodeId, now, prevFinal);
+        publishLivePreview(speaker, text);
+        return;
+      }
+    }
+    openConversationTurn(speaker, text, nodeId, now);
+    publishLivePreview(speaker, text);
+    return;
+  }
+
+  clearOrphanTimer(turn.turnId);
+
+  if (turn.draft === text) {
+    return;
+  }
+
+  if (isSoftRevision(turn.draft, text)) {
+    turn.draft = text;
+    turn.lastUpdateMs = now;
+    scheduleStability(turn.turnId);
+    publishLivePreview(speaker, text);
+    return;
+  }
+
+  finalizeTurn(turn.turnId);
+  openConversationTurn(speaker, text, nodeId, now);
+  publishLivePreview(speaker, text);
+}
+
+function scanCaptionsConversation() {
+  const root = findCaptionRoot();
+  if (!root) {
+    publishCaptionStatus('waiting');
+    return;
+  }
+
+  const blocks = extractBlocks(root);
+  const seen = new Set();
+  let livePreview = 0;
+
+  for (const block of blocks) {
+    const key = blockKey(block);
+    seen.add(key);
+    const { author, text } = readBlock(block);
+    const cleaned = normalizeCaptionText(text);
+    if (!cleaned || isNoise(author, cleaned)) {
+      continue;
+    }
+    livePreview += 1;
+    observeConversationBlock(key, author, cleaned);
+  }
+
+  for (const [nodeId, turnId] of Array.from(turnByNodeId.entries())) {
+    if (!seen.has(nodeId)) {
+      turnByNodeId.delete(nodeId);
+      if (openTurns.has(turnId)) {
+        const turn = openTurns.get(turnId);
+        if (turn) {
+          turn.nodeId = null;
+        }
+        markTurnOrphaned(turnId);
+      }
+    }
+  }
+
+  if (livePreview > 0 || captionLineCount > 0 || openTurns.size > 0) {
+    publishCaptionStatus('live');
+  } else {
+    publishCaptionStatus('waiting');
+  }
+}
+
+function flushConversationTurns() {
+  const ids = Array.from(openTurns.keys());
+  for (const turnId of ids) {
+    finalizeTurn(turnId);
+  }
+  clearAllStabilityTimers();
+  clearAllOrphanTimers();
+  openTurns.clear();
+  turnByNodeId.clear();
+  persistTranscript(true);
 }
 
 function persistTranscript(immediate) {
@@ -317,6 +713,11 @@ function scanCaptions() {
   if (!activeRecording) {
     return;
   }
+  if (conversationMode) {
+    scanCaptionsConversation();
+    return;
+  }
+
   const root = findCaptionRoot();
   if (!root) {
     publishCaptionStatus('waiting');
@@ -392,6 +793,10 @@ function publishLivePreview(author, text) {
 }
 
 function flushActiveBlocks() {
+  if (conversationMode) {
+    flushConversationTurns();
+    return;
+  }
   for (const entry of activeBlocks.values()) {
     commitLine(entry.author, entry.text);
   }
@@ -531,10 +936,24 @@ function initLeaveMonitor() {
   }, 1000);
 }
 
-window.addEventListener('pagehide', () => {
+window.addEventListener('pagehide', pageHideHandler = () => {
   if (activeRecording) {
     notifyMeetEnded();
   }
 });
 
-}
+globalThis.__mlrDisposer = () => {
+  try {
+    chrome.runtime.onMessage.removeListener(onRuntimeMessage);
+  } catch (_) {}
+  activeRecording = false;
+  teardown();
+  hideRecordingOverlay();
+  if (pageHideHandler) {
+    window.removeEventListener('pagehide', pageHideHandler);
+    pageHideHandler = null;
+  }
+  globalThis.__mlrBootVersion = 0;
+};
+
+})();

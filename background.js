@@ -119,12 +119,33 @@ function sendToOffscreen(payload) {
   return chrome.runtime.sendMessage({ target: 'offscreen', ...payload });
 }
 
+const EXPECTED_CONTENT_VERSION = 5;
+
 async function ensureContentScript(tabId) {
+  let version = 0;
   try {
     const response = await chrome.tabs.sendMessage(tabId, { action: 'PING_CONTENT' });
     if (response && response.success) {
-      return;
+      version = Number(response.version) || 0;
     }
+  } catch (_) {}
+
+  if (version >= EXPECTED_CONTENT_VERSION) {
+    return;
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        try {
+          if (typeof globalThis.__mlrDisposer === 'function') {
+            globalThis.__mlrDisposer();
+          }
+        } catch (_) {}
+        globalThis.__mlrBootVersion = 0;
+      }
+    });
   } catch (_) {}
 
   await chrome.scripting.executeScript({
@@ -206,18 +227,37 @@ function formatVttTimestamp(ms) {
   return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}.${pad(millis, 3)}`;
 }
 
+const MIN_VTT_CUE_MS = 1000;
+
 function buildVtt(transcript, startedAt) {
-  const entries = Array.isArray(transcript) ? transcript : [];
+  const entries = Array.isArray(transcript) ? transcript.slice() : [];
+  const hasConversation = entries.some((entry) => entry && entry.mode === 'conversation');
+  if (hasConversation) {
+    entries.sort((a, b) => {
+      const aAt = typeof a.at === 'number' ? a.at : 0;
+      const bAt = typeof b.at === 'number' ? b.at : 0;
+      if (aAt !== bAt) {
+        return aAt - bAt;
+      }
+      return String(a.author || '').localeCompare(String(b.author || ''));
+    });
+  }
+
   let body = 'WEBVTT\n\n';
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
     const text = entry && entry.text ? String(entry.text) : String(entry);
     const at = entry && typeof entry.at === 'number' ? entry.at : startedAt;
     const startMs = Math.max(0, at - startedAt);
-    const nextAt = i + 1 < entries.length && typeof entries[i + 1].at === 'number'
-      ? entries[i + 1].at
-      : at + 3000;
-    const endMs = Math.max(startMs + 1000, nextAt - startedAt);
+    let endMs;
+    if (entry && typeof entry.endAt === 'number') {
+      endMs = Math.max(startMs + MIN_VTT_CUE_MS, entry.endAt - startedAt);
+    } else {
+      const nextAt = i + 1 < entries.length && typeof entries[i + 1].at === 'number'
+        ? entries[i + 1].at
+        : at + 3000;
+      endMs = Math.max(startMs + MIN_VTT_CUE_MS, nextAt - startedAt);
+    }
     body += `${i + 1}\n${formatVttTimestamp(startMs)} --> ${formatVttTimestamp(endMs)}\n${text}\n\n`;
   }
   return body;
@@ -264,11 +304,18 @@ async function startRecordingSequence() {
     };
 
     await ensureContentScript(tab.id);
-    chrome.tabs.sendMessage(tab.id, { action: 'START_SCRAPING' }).catch(() => {});
+    const settings = await chrome.storage.local.get(['conversationVtt']);
+    const conversationVtt = Boolean(settings.conversationVtt);
+    const scrapeResult = await chrome.tabs.sendMessage(tab.id, {
+      action: 'START_SCRAPING',
+      conversationVtt
+    }).catch(() => null);
 
     return {
       hasMic: Boolean(startResult.hasMic),
-      audioTracks: startResult.audioTracks || 0
+      audioTracks: startResult.audioTracks || 0,
+      conversationMode: Boolean(scrapeResult && scrapeResult.conversationMode),
+      conversationVtt
     };
   } catch (err) {
     await chrome.storage.local.set({
