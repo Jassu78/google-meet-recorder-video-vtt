@@ -1,5 +1,4 @@
 let recorder = null;
-let chunks = [];
 let baseStream = null;
 let micStream = null;
 let audioCtx = null;
@@ -7,6 +6,16 @@ let keepAliveSource = null;
 let micTrack = null;
 let meetMuted = false;
 let recordedStream = null;
+
+let storageMode = 'memory';
+let memoryChunks = [];
+let opfsDir = null;
+let opfsFileHandle = null;
+let opfsWritable = null;
+let opfsFileName = null;
+let writeChain = Promise.resolve();
+let bytesWritten = 0;
+let writeFailed = false;
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.target && message.target !== 'offscreen') {
@@ -76,12 +85,185 @@ function buildRecordStream(tabStream, optionalMic) {
   return new MediaStream([...tabVideoTracks, ...dest.stream.getAudioTracks()]);
 }
 
+async function resetStorageState() {
+  writeChain = Promise.resolve();
+  memoryChunks = [];
+  bytesWritten = 0;
+  writeFailed = false;
+  storageMode = 'memory';
+  opfsFileName = null;
+
+  if (opfsWritable) {
+    try {
+      await opfsWritable.abort();
+    } catch (_) {
+      try {
+        await opfsWritable.close();
+      } catch (_) {}
+    }
+  }
+  opfsWritable = null;
+  opfsFileHandle = null;
+}
+
+async function cleanupOpfsFile(fileName) {
+  if (!fileName || !opfsDir) {
+    return;
+  }
+  try {
+    await opfsDir.removeEntry(fileName);
+  } catch (_) {}
+}
+
+async function clearStaleOpfsRecordings() {
+  if (!navigator.storage || !navigator.storage.getDirectory) {
+    return;
+  }
+  try {
+    const root = await navigator.storage.getDirectory();
+    let dir;
+    try {
+      dir = await root.getDirectoryHandle('recordings');
+    } catch (_) {
+      return;
+    }
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind === 'file' && name.endsWith('.webm')) {
+        try {
+          await dir.removeEntry(name);
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+}
+
+async function openOpfsWriter() {
+  if (!navigator.storage || !navigator.storage.getDirectory) {
+    return false;
+  }
+  try {
+    if (navigator.storage.persist) {
+      try {
+        await navigator.storage.persist();
+      } catch (_) {}
+    }
+    const root = await navigator.storage.getDirectory();
+    opfsDir = await root.getDirectoryHandle('recordings', { create: true });
+    opfsFileName = `recording-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.webm`;
+    opfsFileHandle = await opfsDir.getFileHandle(opfsFileName, { create: true });
+    opfsWritable = await opfsFileHandle.createWritable({ keepExistingData: false });
+    storageMode = 'opfs';
+    return true;
+  } catch (_) {
+    opfsWritable = null;
+    opfsFileHandle = null;
+    opfsFileName = null;
+    storageMode = 'memory';
+    return false;
+  }
+}
+
+async function salvageOpfsIntoMemory() {
+  if (!opfsFileHandle) {
+    return;
+  }
+  try {
+    if (opfsWritable) {
+      try {
+        await opfsWritable.close();
+      } catch (_) {
+        try {
+          await opfsWritable.abort();
+        } catch (_) {}
+      }
+      opfsWritable = null;
+    }
+    const partial = await opfsFileHandle.getFile();
+    if (partial && partial.size > 0) {
+      memoryChunks.unshift(partial);
+    }
+  } catch (_) {}
+}
+
+function enqueueChunk(blob) {
+  if (!blob || !blob.size) {
+    return;
+  }
+
+  if (storageMode !== 'opfs' || writeFailed || !opfsWritable) {
+    memoryChunks.push(blob);
+    bytesWritten += blob.size;
+    return;
+  }
+
+  writeChain = writeChain.then(async () => {
+    if (writeFailed || !opfsWritable) {
+      memoryChunks.push(blob);
+      bytesWritten += blob.size;
+      return;
+    }
+    try {
+      await opfsWritable.write(blob);
+      bytesWritten += blob.size;
+    } catch (_) {
+      writeFailed = true;
+      await salvageOpfsIntoMemory();
+      memoryChunks.push(blob);
+      bytesWritten += blob.size;
+      storageMode = 'memory';
+    }
+  });
+}
+
+async function flushWrites() {
+  await writeChain;
+}
+
+async function finalizeRecordingBlob(mimeType) {
+  await flushWrites();
+
+  const savedName = opfsFileName;
+
+  if (storageMode === 'opfs' && opfsWritable) {
+    try {
+      await opfsWritable.close();
+    } catch (_) {
+      try {
+        await opfsWritable.abort();
+      } catch (_) {}
+    }
+    opfsWritable = null;
+  }
+
+  let blob;
+  if (storageMode === 'opfs' && opfsFileHandle && !writeFailed) {
+    const file = await opfsFileHandle.getFile();
+    if (memoryChunks.length) {
+      const buffer = await file.arrayBuffer();
+      blob = new Blob([buffer, ...memoryChunks], { type: mimeType });
+    } else {
+      const buffer = await file.arrayBuffer();
+      blob = new Blob([buffer], { type: mimeType });
+    }
+  } else {
+    blob = new Blob(memoryChunks, { type: mimeType });
+  }
+
+  memoryChunks = [];
+  await cleanupOpfsFile(savedName);
+  opfsFileHandle = null;
+  opfsFileName = null;
+
+  return blob;
+}
+
 async function startRecording(streamId) {
   if (recorder && recorder.state === 'recording') {
     throw new Error('Already recording');
   }
 
-  chunks = [];
+  await resetStorageState();
+  await clearStaleOpfsRecordings();
   meetMuted = false;
   micTrack = null;
 
@@ -126,10 +308,16 @@ async function startRecording(streamId) {
     ? 'video/webm;codecs=vp8,opus'
     : 'video/webm';
 
+  const opfsReady = await openOpfsWriter();
+  if (!opfsReady) {
+    storageMode = 'memory';
+    memoryChunks = [];
+  }
+
   recorder = new MediaRecorder(recordedStream, { mimeType, audioBitsPerSecond: 128000 });
   recorder.ondataavailable = (event) => {
     if (event.data && event.data.size > 0) {
-      chunks.push(event.data);
+      enqueueChunk(event.data);
     }
   };
 
@@ -159,7 +347,7 @@ async function startRecording(streamId) {
   }).catch(() => {});
 
   window.location.hash = 'recording';
-  return { hasMic, mimeType };
+  return { hasMic, mimeType, storageMode };
 }
 
 function stopTracks() {
@@ -200,28 +388,36 @@ function stopRecording(filename) {
     }
 
     const mimeType = active.mimeType || 'video/webm';
+    const modeAtStop = storageMode;
+
     active.onstop = () => {
-      try {
-        const blob = new Blob(chunks, { type: mimeType });
-        chunks = [];
-        recorder = null;
-        stopTracks();
-        window.location.hash = '';
-        if (!blob.size) {
-          resolve({ ok: false, error: 'Recording produced 0 bytes', byteLength: 0 });
-          return;
-        }
-        resolve({
-          ok: true,
-          blobUrl: URL.createObjectURL(blob),
-          byteLength: blob.size,
-          mimeType,
-          extension: 'webm',
-          filename: filename || `Meet-Recording-${Date.now()}.webm`
+      finalizeRecordingBlob(mimeType)
+        .then((blob) => {
+          recorder = null;
+          stopTracks();
+          window.location.hash = '';
+
+          if (!blob || !blob.size) {
+            resolve({ ok: false, error: 'Recording produced 0 bytes', byteLength: 0 });
+            return;
+          }
+
+          resolve({
+            ok: true,
+            blobUrl: URL.createObjectURL(blob),
+            byteLength: blob.size,
+            mimeType,
+            extension: 'webm',
+            filename: filename || `Meet-Recording-${Date.now()}.webm`,
+            storageMode: writeFailed ? 'memory-fallback' : modeAtStop
+          });
+        })
+        .catch((err) => {
+          recorder = null;
+          stopTracks();
+          window.location.hash = '';
+          reject(err);
         });
-      } catch (err) {
-        reject(err);
-      }
     };
 
     try {
